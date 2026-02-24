@@ -47,7 +47,7 @@ func main() {
 		}()
 	}
 
-	select {} // run forever
+	select {} // forever
 }
 
 func parseMappings(s string) ([]Mapping, error) {
@@ -114,7 +114,7 @@ func handleConn(client net.Conn, m Mapping, shadowDialTimeout, shadowWriteTimeou
 	}
 	defer primary.Close()
 
-	// Shadow is best-effort: if dial fails, we continue with primary only.
+	// Shadow is best effort
 	var shadow net.Conn
 	shadow, err = net.DialTimeout("tcp", m.Shadow, shadowDialTimeout)
 	if err != nil {
@@ -135,7 +135,7 @@ func handleConn(client net.Conn, m Mapping, shadowDialTimeout, shadowWriteTimeou
 		}
 	}()
 
-	// primary -> client (genelde boş; ama az da olsa reply varsa tıkanmasın)
+	// primary -> client
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(client, primary)
@@ -149,11 +149,11 @@ func teeCopy(primary io.Writer, shadow net.Conn, src io.Reader, shadowWriteTimeo
 	for {
 		n, rerr := src.Read(buf)
 		if n > 0 {
-			// Primary write must succeed.
+			// Primary write must succeed
 			if _, werr := primary.Write(buf[:n]); werr != nil {
 				return
 			}
-			// Shadow write best-effort with short deadline.
+			// Shadow write best-effort
 			if shadow != nil {
 				_ = shadow.SetWriteDeadline(time.Now().Add(shadowWriteTimeout))
 				_, _ = shadow.Write(buf[:n])
