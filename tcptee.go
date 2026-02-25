@@ -13,19 +13,17 @@ import (
 )
 
 type Mapping struct {
-	Listen  string
-	Primary string
-	Shadow  string
+	Listen   string
+	Primary1 string // App1 - response used for client
+	Primary2 string // App2 - response discarded but required
 }
 
 func main() {
 	var mapsArg string
-	var shadowTimeout time.Duration
-	var shadowDialTimeout time.Duration
+	var primary2DialTimeout time.Duration
 
-	flag.StringVar(&mapsArg, "maps", "", `Comma-separated mappings: listen=IP:port;primary=IP:port;shadow=IP:port`)
-	flag.DurationVar(&shadowTimeout, "shadow-timeout", 50*time.Millisecond, "Max time allowed for each shadow write (best-effort)")
-	flag.DurationVar(&shadowDialTimeout, "shadow-dial-timeout", 500*time.Millisecond, "Timeout for establishing shadow connection")
+	flag.StringVar(&mapsArg, "maps", "", `Comma-separated mappings: listen=IP:port;primary1=IP:port;primary2=IP:port`)
+	flag.DurationVar(&primary2DialTimeout, "primary2-dial-timeout", 3*time.Second, "Timeout for establishing primary2 connection")
 	flag.Parse()
 
 	if mapsArg == "" {
@@ -41,7 +39,7 @@ func main() {
 	for _, m := range mappings {
 		m := m
 		go func() {
-			if err := serve(m, shadowDialTimeout, shadowTimeout); err != nil {
+			if err := serve(m, primary2DialTimeout); err != nil {
 				log.Fatalf("listener %s: %v", m.Listen, err)
 			}
 		}()
@@ -71,15 +69,15 @@ func parseMappings(s string) ([]Mapping, error) {
 			switch k {
 			case "listen":
 				m.Listen = v
-			case "primary":
-				m.Primary = v
-			case "shadow":
-				m.Shadow = v
+			case "primary1":
+				m.Primary1 = v
+			case "primary2":
+				m.Primary2 = v
 			default:
 				return nil, fmt.Errorf("unknown key %q in %q", k, item)
 			}
 		}
-		if m.Listen == "" || m.Primary == "" || m.Shadow == "" {
+		if m.Listen == "" || m.Primary1 == "" || m.Primary2 == "" {
 			return nil, fmt.Errorf("incomplete mapping: %q", p)
 		}
 		out = append(out, m)
@@ -87,12 +85,12 @@ func parseMappings(s string) ([]Mapping, error) {
 	return out, nil
 }
 
-func serve(m Mapping, shadowDialTimeout, shadowWriteTimeout time.Duration) error {
+func serve(m Mapping, primary2DialTimeout time.Duration) error {
 	ln, err := net.Listen("tcp", m.Listen)
 	if err != nil {
 		return err
 	}
-	log.Printf("listening %s -> primary %s, shadow %s", m.Listen, m.Primary, m.Shadow)
+	log.Printf("listening %s -> primary1 %s, primary2 %s", m.Listen, m.Primary1, m.Primary2)
 
 	for {
 		c, err := ln.Accept()
@@ -100,64 +98,70 @@ func serve(m Mapping, shadowDialTimeout, shadowWriteTimeout time.Duration) error
 			log.Printf("accept(%s): %v", m.Listen, err)
 			continue
 		}
-		go handleConn(c, m, shadowDialTimeout, shadowWriteTimeout)
+		go handleConn(c, m, primary2DialTimeout)
 	}
 }
 
-func handleConn(client net.Conn, m Mapping, shadowDialTimeout, shadowWriteTimeout time.Duration) {
+func handleConn(client net.Conn, m Mapping, primary2DialTimeout time.Duration) {
 	defer client.Close()
 
-	primary, err := net.DialTimeout("tcp", m.Primary, 3*time.Second)
+	// Connect to Primary1 (mandatory)
+	primary1, err := net.DialTimeout("tcp", m.Primary1, 3*time.Second)
 	if err != nil {
-		log.Printf("[%s] primary dial failed: %v", m.Listen, err)
+		log.Printf("[%s] primary1 dial failed: %v", m.Listen, err)
 		return
 	}
-	defer primary.Close()
+	defer primary1.Close()
 
-	// Shadow is best effort
-	var shadow net.Conn
-	shadow, err = net.DialTimeout("tcp", m.Shadow, shadowDialTimeout)
+	// Connect to Primary2 (mandatory)
+	primary2, err := net.DialTimeout("tcp", m.Primary2, primary2DialTimeout)
 	if err != nil {
-		shadow = nil
-	} else {
-		defer shadow.Close()
+		log.Printf("[%s] primary2 dial failed: %v", m.Listen, err)
+		return
 	}
+	defer primary2.Close()
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 
-	// client -> primary (+shadow)
+	// client -> primary1 AND primary2 (both receive all data)
 	go func() {
 		defer wg.Done()
-		teeCopy(primary, shadow, client, shadowWriteTimeout)
-		if tcp, ok := primary.(*net.TCPConn); ok {
+		teeCopy(primary1, primary2, client)
+		if tcp, ok := primary1.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+		if tcp, ok := primary2.(*net.TCPConn); ok {
 			_ = tcp.CloseWrite()
 		}
 	}()
 
-	// primary -> client
+	// primary1 -> client (only primary1 response goes to client)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(client, primary)
+		_, _ = io.Copy(client, primary1)
+	}()
+
+	// primary2 -> discard (consume and ignore response)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(io.Discard, primary2)
 	}()
 
 	wg.Wait()
 }
 
-func teeCopy(primary io.Writer, shadow net.Conn, src io.Reader, shadowWriteTimeout time.Duration) {
+func teeCopy(primary1, primary2 io.Writer, src io.Reader) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, rerr := src.Read(buf)
 		if n > 0 {
-			// Primary write must succeed
-			if _, werr := primary.Write(buf[:n]); werr != nil {
+			// Both writes must succeed
+			if _, werr := primary1.Write(buf[:n]); werr != nil {
 				return
 			}
-			// Shadow write best-effort
-			if shadow != nil {
-				_ = shadow.SetWriteDeadline(time.Now().Add(shadowWriteTimeout))
-				_, _ = shadow.Write(buf[:n])
-				_ = shadow.SetWriteDeadline(time.Time{})
+			if _, werr := primary2.Write(buf[:n]); werr != nil {
+				return
 			}
 		}
 		if rerr != nil {
